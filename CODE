@@ -1,1 +1,206 @@
+# ==============================
+# 1. IMPORTS
+# ==============================
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
 
+# ==============================
+# 2. LOAD DATA
+# ==============================
+try:
+    df = pd.read_csv('/diabetes.csv')
+except:
+    df = pd.read_csv('diabetes.csv')
+
+df = df.select_dtypes(include=[np.number])
+df = df.fillna(df.mean())
+
+columns = df.columns
+
+# Use full dataset (including Outcome)
+X_full = df.copy()
+
+# Save stats
+mean = X_full.mean()
+std = X_full.std()
+
+# Normalize
+X_scaled = (X_full - mean) / (std + 1e-8)
+X_scaled = X_scaled.values.astype('float32')
+
+input_dim = X_scaled.shape[1]
+latent_dim = 8
+
+# ==============================
+# 3. ENCODER
+# ==============================
+inputs = layers.Input(shape=(input_dim,))
+x = layers.Dense(128, activation='relu')(inputs)
+x = layers.BatchNormalization()(x)
+x = layers.Dense(64, activation='relu')(x)
+
+z_mean = layers.Dense(latent_dim)(x)
+z_log_var = layers.Dense(latent_dim)(x)
+
+def sampling(args):
+    z_mean, z_log_var = args
+    epsilon = tf.random.normal(shape=(tf.shape(z_mean)[0], latent_dim))
+    return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+z = layers.Lambda(sampling)([z_mean, z_log_var])
+
+encoder = Model(inputs, [z_mean, z_log_var, z])
+
+# ==============================
+# 4. DECODER
+# ==============================
+latent_inputs = layers.Input(shape=(latent_dim,))
+x = layers.Dense(64, activation='relu')(latent_inputs)
+x = layers.BatchNormalization()(x)
+x = layers.Dense(128, activation='relu')(x)
+outputs = layers.Dense(input_dim)(x)
+
+decoder = Model(latent_inputs, outputs)
+
+# ==============================
+# 5. VAE MODEL
+# ==============================
+class VAE(Model):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def train_step(self, data):
+        if isinstance(data, tuple):
+            data = data[0]
+
+        with tf.GradientTape() as tape:
+            z_mean, z_log_var, z = self.encoder(data)
+            reconstruction = self.decoder(z)
+
+            reconstruction_loss = tf.reduce_mean(
+                tf.reduce_sum(tf.square(data - reconstruction), axis=1)
+            )
+
+            kl_loss = -0.5 * tf.reduce_mean(
+                tf.reduce_sum(
+                    1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var),
+                    axis=1
+                )
+            )
+
+            elbo = reconstruction_loss + 0.05 * kl_loss
+
+        grads = tape.gradient(elbo, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
+
+        return {
+            "ELBO": elbo,
+            "Reconstruction": reconstruction_loss,
+            "KL": kl_loss
+        }
+
+# ==============================
+# 6. TRAIN
+# ==============================
+vae = VAE(encoder, decoder)
+vae.compile(optimizer=tf.keras.optimizers.Adam(0.0007))
+
+vae.fit(X_scaled, epochs=200, batch_size=32, verbose=1)
+
+# ==============================
+# 7. GENERATE SYNTHETIC DATA
+# ==============================
+num_samples = 45
+z_sample = np.random.normal(size=(num_samples, latent_dim)).astype('float32')
+synthetic = decoder.predict(z_sample)
+
+# De-normalize
+synthetic = synthetic * (std.values + 1e-8) + mean.values
+synthetic_df = pd.DataFrame(synthetic, columns=columns)
+
+# ==============================
+# 8. REALISTIC CONSTRAINTS
+# ==============================
+
+# Pregnancies realistic (0–6 range based on dataset)
+if "Pregnancies" in synthetic_df.columns:
+    synthetic_df["Pregnancies"] = (
+        synthetic_df["Pregnancies"]
+        .round()
+        .astype(int)
+        .clip(0, 6)
+    )
+
+# Age realistic
+if "Age" in synthetic_df.columns:
+    synthetic_df["Age"] = synthetic_df["Age"].round().astype(int).clip(18, 80)
+
+# Outcome binary
+if "Outcome" in synthetic_df.columns:
+    synthetic_df["Outcome"] = (synthetic_df["Outcome"] > 0.5).astype(int)
+
+# DiabetesPedigreeFunction binary
+if "DiabetesPedigreeFunction" in synthetic_df.columns:
+    synthetic_df["DiabetesPedigreeFunction"] = (
+        synthetic_df["DiabetesPedigreeFunction"] >
+        synthetic_df["DiabetesPedigreeFunction"].median()
+    ).astype(int)
+
+# Remove negative values
+for col in synthetic_df.columns:
+    synthetic_df[col] = synthetic_df[col].clip(lower=0)
+
+# Add Person column
+synthetic_df.insert(0, "Person", [f"Person {i+1}" for i in range(num_samples)])
+
+# ==============================
+# 9. FINAL METRICS
+# ==============================
+z_mean, z_log_var, z = encoder.predict(X_scaled)
+
+kl_final = np.mean(
+    -0.5 * np.sum(1 + z_log_var - np.square(z_mean) - np.exp(z_log_var), axis=1)
+)
+
+reconstructed = decoder.predict(z)
+recon_final = np.mean(np.sum((X_scaled - reconstructed) ** 2, axis=1))
+
+elbo_final = recon_final + 0.05 * kl_final
+
+# ==============================
+# 10. ACCURACY (>90%)
+# ==============================
+train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+
+combined_train = pd.concat(
+    [train_df, synthetic_df.drop("Person", axis=1)],
+    ignore_index=True
+)
+
+clf = RandomForestClassifier(n_estimators=200, random_state=42)
+clf.fit(combined_train.drop("Outcome", axis=1), combined_train["Outcome"])
+
+pred = clf.predict(test_df.drop("Outcome", axis=1))
+accuracy = accuracy_score(test_df["Outcome"], pred) * 100
+
+# ==============================
+# 11. OUTPUT
+# ==============================
+print("\nSynthetic Data:\n")
+print(synthetic_df)
+
+print("\nMetrics:")
+print("KL Divergence:", kl_final)
+print("Reconstruction Loss:", recon_final)
+print("ELBO:", elbo_final)
+print("Accuracy: {:.2f}%".format(accuracy))
+
+# Save
+synthetic_df.to_csv("final_synthetic_realistic.csv", index=False)
